@@ -18,7 +18,7 @@ object GenJars extends Build {
     scalaVersion := "2.11.7",
     ivyConfigurations ++= Seq(Osgi, FelixBundles),
     libraryDependencies += "org.apache.felix" % "org.apache.felix.bundlerepository" % "2.0.4" % FelixBundles,
-    managedClasspath := Attributed.blankSeq(testIt.value),
+    managedClasspath in Compile := Attributed.blankSeq(testIt.value),
     libraryDependencies ++= {
       val akkaV = "2.3.11"
       val streamV = "1.0-RC4"
