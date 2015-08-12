@@ -1,4 +1,7 @@
+import org.apache.felix.bundlerepository.Repository
+import org.osgi.framework.VersionRange
 import osgifelix._
+import osgifelix.sbtutils._
 import sbt._
 import sbt.Keys._
 import scalaz.Id.Id
@@ -11,69 +14,107 @@ object GenJars extends Build {
 
   lazy val testIt = taskKey[Seq[File]]("Test bundle creation")
   lazy val createRepo = taskKey[File]("Create a OBR repo")
+  lazy val origUpdate = taskKey[UpdateReport]("Original update report")
+  lazy val osgiRepo = taskKey[Repository]("Repository for resolving osgi dependencies")
+  lazy val osgiInstructions = taskKey[Seq[BundleInstructions]]("Instructions for BND")
 
   lazy val Osgi = config("osgi")
   lazy val FelixBundles = config("felixbundles")
+
+  lazy val repoAdminTask = Def.task {
+    val bundleJars = origUpdate.value.matching(configurationFilter(FelixBundles.name) && artifactFilter(`type` = "bundle"))
+    FelixRepositories.runRepoAdmin(bundleJars)
+  }
+
+  lazy val cachedRepoLookup = Def.taskDyn[Repository] {
+    val instructions = osgiInstructions.value
+    val cacheFile = target.value / "bundle.cache"
+      val binDir = target.value / "bundles"
+    val indexFile = target.value / "index.xml"
+    val cacheData = BndManifestGenerator.serialize(instructions)
+    if (cacheFile.exists() && indexFile.exists() && IO.read(cacheFile) == cacheData) {
+      Def.task {
+        repoAdminTask.value(_.loadRepository(indexFile))
+      }
+    } else Def.task {
+      IO.write(cacheFile, cacheData)
+      IO.delete(binDir)
+      IO.createDirectory(binDir)
+      val logger = streams.value.log
+      val builder = BndManifestGenerator.buildJars[Id](instructions, binDir)
+      val jars = builder.run(new BundleProgress[Id] {
+        override def info(msg: String): Id[Unit] = {
+          logger.info(msg)
+        }
+      }).map(_.jf).toSeq
+      repoAdminTask.value { repoAdmin =>
+        val repo = repoAdmin.createIndexedRepository(jars)
+        repoAdmin.writeRepo(repo, indexFile)
+        repo
+      }
+    }
+  }
+
   lazy val root = (project in new File(".")).settings(
     scalaVersion := "2.11.7",
     ivyConfigurations ++= Seq(Osgi, FelixBundles),
     libraryDependencies += "org.apache.felix" % "org.apache.felix.bundlerepository" % "2.0.4" % FelixBundles,
-    managedClasspath in Compile := Attributed.blankSeq(testIt.value),
+    origUpdate := Classpaths.updateTask.value,
     libraryDependencies ++= {
       val akkaV = "2.3.11"
       val streamV = "1.0-RC4"
       toConfig(Osgi, Seq(
-        "com.typesafe.akka" %% "akka-stream-experimental" % streamV,
-        "com.typesafe.akka" %% "akka-http-core-experimental" % streamV,
-        "com.typesafe.akka" %% "akka-http-experimental" % streamV,
-        "com.typesafe.akka" %% "akka-actor" % akkaV,
-        "com.typesafe.akka" %% "akka-osgi" % akkaV,
-        "com.typesafe.akka" %% "akka-testkit" % akkaV % "test",
+        /*        "com.typesafe.akka" %% "akka-stream-experimental" % streamV,
+                "com.typesafe.akka" %% "akka-http-core-experimental" % streamV,
+                "com.typesafe.akka" %% "akka-http-experimental" % streamV,
+                "com.typesafe.akka" %% "akka-actor" % akkaV,
+                "com.typesafe.akka" %% "akka-osgi" % akkaV,
+                "com.typesafe.akka" %% "akka-testkit" % akkaV % "test",*/
         "org.specs2" %% "specs2-core" % "2.3.11" % "test",
         "io.argonaut" %% "argonaut" % "6.1",
         "org.xerial.snappy" % "snappy-java" % "1.1.1.7",
         "org.eclipse.equinox" % "registry" % "3.5.400-v20140428-1507"
       )) // ++ epsDeps)
     },
-    createRepo := {
-      val indexFile = target.value / "index.xml"
-      val bundles = testIt.value
-      val bundleJars = update.value.matching(configurationFilter(FelixBundles.name) && artifactFilter(`type` = "bundle"))
-      FelixRepositories.runRepoAdmin(bundleJars) { repoAdmin =>
-        val repo = repoAdmin.createIndexedRepository(bundles)
-        repoAdmin.writeRepo(repo, indexFile)
-      }
-      indexFile
-    }
-
-    ,
-    testIt := {
-      val binDir = target.value / "bundles"
-      val srcsDir = target.value / "bundle-srcs"
-      IO.delete(Seq(binDir, srcsDir))
-      IO.createDirectories(Seq(binDir, srcsDir))
-      val ordered = SbtUtils.orderedDependencies(update.value.configuration("osgi").get)
+    classifiersModule := {
+      GetClassifiersModule("ok" % "ok" % "1.2", Seq.empty, Seq.empty, Seq.empty)
+    },
+    osgiInstructions := {
+      val ordered = SbtUtils.orderedDependencies(origUpdate.value.configuration("osgi").get)
       val typeFilter: NameFilter = "jar" | "bundle"
       val artifacts = ordered.flatMap { mr =>
         mr.artifacts.collectFirst {
           case (artifact, file) if typeFilter.accept(artifact.`type`) => (mr.module, artifact, file)
         }
       }
-      val files = artifacts.map {
+      artifacts.map {
         case (moduleId, artifact, file) =>
           val (jar, deets) = BndManifestGenerator.parseDetails(file)
-          deets.map(_ => CopyBundle(file, jar, Nil)).getOrElse {
-            RewriteManifest(jar, "com.test." + moduleId.name, SbtUtils.convertRevision(moduleId.revision), Nil, ManifestInstructions.Default)
+          deets.map(_ => UseBundle(Some(moduleId), file, jar)).getOrElse {
+            RewriteManifest(Some(moduleId), jar, "com.test." + moduleId.name, SbtUtils.convertRevision(moduleId.revision), ManifestInstructions.Default)
           }
       }
-      val logger = streams.value.log
-      val builder = BndManifestGenerator.buildJars[Id](files, binDir, srcsDir)
-      val jars = builder.run(new BundleProgress[Id] {
-        override def info(msg: String): Id[Unit] = {
-          logger.info(msg)
-        }
-      })
-      jars.map(_.jf).toSeq
+    },
+    osgiRepo := cachedRepoLookup.value,
+    update := {
+      val updateReport = update.value
+      val cached = target.value / "update.cache"
+      val repo = osgiRepo.value
+      val resolved = repoAdminTask.value { repoAdmin =>
+        repoAdmin.resolveRequirements(repo, Seq(PackageRequirement("argonaut"), BundleRequirement("org.scalaz.core", Some(new VersionRange("(7.1,8.0]")))))
+      }.leftMap {
+        _.foreach(r => System.err.println(r.getRequirement))
+      }.getOrElse(Seq.empty)
+      val osgiModules = resolved.map { f =>
+        val mr = ModuleReport("osgi" % f.getName % "1.0", Seq(Artifact(f.getName) -> f), Seq.empty)
+        OrganizationArtifactReport("osgi", f.getName, Seq(mr))
+      }
+      val configReport = updateReport.configuration("scala-tool").get
+      val allNewModules = osgiModules.flatMap(_.modules) ++ configReport.modules
+      val allOrgReportts = configReport.details ++ osgiModules
+      val newConfig = new ConfigurationReport("compile", allNewModules, allOrgReportts, Seq.empty)
+      val newConfigs = Seq(newConfig) ++ (updateReport.configurations.filter(r => !Set("compile", "runtime").contains(r.configuration)))
+      new UpdateReport(cached, newConfigs, new UpdateStats(0, 0, 0, false), Map.empty)
     }
   )
 
