@@ -5,5 +5,5 @@ import scalaz.\/
 
 class Ok extends App {
 
-  def fudge: String \/ Int
+  def fudge: String \/ Int = ???
 }
