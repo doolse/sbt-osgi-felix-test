@@ -1,3 +1,5 @@
+package com.test.sbt
+
 /**
  * Created by jolz on 12/08/15.
  */

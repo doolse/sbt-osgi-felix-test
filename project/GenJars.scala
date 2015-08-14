@@ -1,11 +1,15 @@
-import org.apache.felix.bundlerepository.Repository
+import org.apache.felix.bundlerepository.{Reason, Repository}
 import org.osgi.framework.{Version, VersionRange}
 import osgifelix._
 import osgifelix.InstructionFilter._
 import osgifelix.BundleInstructions._
 import sbt._
 import sbt.Keys._
+import scalaz.{\/-, -\/}
 import scalaz.Id.Id
+import com.typesafe.sbt.osgi._
+import com.typesafe.sbt.osgi.OsgiKeys._
+import scala.collection.JavaConversions._
 
 object GenJars extends Build {
 
@@ -14,19 +18,29 @@ object GenJars extends Build {
   }
 
   lazy val testIt = taskKey[Seq[File]]("Test bundle creation")
-  lazy val createRepo = taskKey[File]("Create a OBR repo")
-  lazy val origUpdate = taskKey[UpdateReport]("Original update report")
-  lazy val osgiRepo = taskKey[Repository]("Repository for resolving osgi dependencies")
+  lazy val originalUpdate = taskKey[UpdateReport]("Original update report")
+  lazy val osgiRepository = taskKey[Repository]("Repository for resolving osgi dependencies")
   lazy val osgiInstructions = taskKey[Seq[BundleInstructions]]("Instructions for BND")
   lazy val osgiDependencies = settingKey[Seq[OsgiRequirement]]("OSGi dependencies")
   lazy val osgiFilterRules = settingKey[Seq[InstructionFilter]]("Filters for generating BND instructions")
+  lazy val manifestText = taskKey[String]("Gen the MANIFEST")
 
   lazy val Osgi = config("osgi")
   lazy val FelixBundles = config("felixbundles")
 
   lazy val repoAdminTask = Def.task {
-    val bundleJars = origUpdate.value.matching(configurationFilter(FelixBundles.name) && artifactFilter(`type` = "bundle"))
-    FelixRepositories.runRepoAdmin(bundleJars)
+    val storage = target.value / "repo-admin"
+    val bundleJars = originalUpdate.value.matching(configurationFilter(FelixBundles.name) && artifactFilter(`type` = "bundle"))
+    FelixRepositories.runRepoAdmin(bundleJars, storage)
+  }
+
+  def writeErrors(reasons: Array[Reason], logger: Logger) = {
+    reasons.foreach {
+      r => logger.error {
+        val req = r.getRequirement
+        s"Failed to find ${req.getName} with ${req.getFilter} for ${r.getResource.getSymbolicName} "
+      }
+    }
   }
 
   lazy val cachedRepoLookup = Def.taskDyn[Repository] {
@@ -51,7 +65,7 @@ object GenJars extends Build {
         }
       }).map(_.jf).toSeq
       repoAdminTask.value { repoAdmin =>
-        val repo = repoAdmin.createIndexedRepository(jars)
+        val repo = repoAdmin.createIndexedRepository(jars.map(BundleLocation.apply))
         val reasons = repoAdmin.checkConsistency(repo)
         if (reasons.isEmpty)
         {
@@ -59,39 +73,20 @@ object GenJars extends Build {
           repoAdmin.writeRepo(repo, indexFile)
           repo
         } else {
-          reasons.foreach {
-            r => logger.error {
-              val req = r.getRequirement
-              s"Failed to find ${req.getName} with ${req.getFilter} for ${r.getResource.getSymbolicName} "
-            }
-          }
+          writeErrors(reasons, logger)
           sys.error("Failed consistency check")
         }
       }
     }
   }
 
-  lazy val root = (project in new File(".")).settings(
+  lazy val root = (project in new File(".")).settings(SbtOsgi.defaultOsgiSettings: _*).settings(
     scalaVersion := "2.11.7",
     ivyConfigurations ++= Seq(Osgi, FelixBundles),
     libraryDependencies += "org.apache.felix" % "org.apache.felix.bundlerepository" % "2.0.4" % FelixBundles,
-    origUpdate := Classpaths.updateTask.value,
+    originalUpdate := Classpaths.updateTask.value,
     libraryDependencies ++= {
-      val akkaV = "2.3.11"
-      val streamV = "1.0-RC4"
-      toConfig(Osgi, Seq(
-        "com.typesafe.akka" %% "akka-stream-experimental" % streamV,
-        "com.typesafe.akka" %% "akka-http-core-experimental" % streamV,
-        "com.typesafe.akka" %% "akka-http-experimental" % streamV,
-        "com.typesafe.akka" %% "akka-actor" % akkaV,
-        "com.typesafe.akka" %% "akka-osgi" % akkaV,
-        "com.typesafe.akka" %% "akka-testkit" % akkaV % "test",
-        "org.specs2" %% "specs2-core" % "2.3.11" % "test",
-        "io.argonaut" %% "argonaut" % "6.1",
-        "org.xerial.snappy" % "snappy-java" % "1.1.1.7",
-        "org.eclipse.equinox" % "registry" % "3.5.400-v20140428-1507",
-        "org.eclipse.tycho" % "org.eclipse.osgi" % "3.10.100.v20150529-1857"
-      ) ++ epsDeps)
+      toConfig(Osgi, epsDeps)
     },
     classifiersModule := {
       GetClassifiersModule("ok" % "ok" % "1.2", Seq.empty, Seq.empty, Seq.empty)
@@ -103,7 +98,7 @@ object GenJars extends Build {
       )))
     },
     osgiInstructions ++= {
-      val ordered = SbtUtils.orderedDependencies(origUpdate.value.configuration("osgi").get)
+      val ordered = SbtUtils.orderedDependencies(originalUpdate.value.configuration("osgi").get)
       val typeFilter: NameFilter = "jar" | "bundle"
       val artifacts = ordered.flatMap { mr =>
         mr.artifacts.collectFirst {
@@ -120,7 +115,71 @@ object GenJars extends Build {
       }
       insts
     },
-    osgiRepo := cachedRepoLookup.value,
+    osgiRepository := cachedRepoLookup.value,
+    update := {
+      val updateReport = originalUpdate.value
+      val cached = target.value / "update.cache"
+      val repo = osgiRepository.value
+      val deps = osgiDependencies.value
+      val resolved = repoAdminTask.value { repoAdmin =>
+        repoAdmin.resolveRequirements(Seq(repo), deps)
+      }.leftMap {
+        writeErrors(_, streams.value.log)
+      }.getOrElse(Seq.empty)
+      val osgiModules = resolved.map { bl =>
+        val f = bl.file
+        val mr = ModuleReport("osgi" % f.getName % "1.0", Seq(Artifact(f.getName) -> f), Seq.empty)
+        OrganizationArtifactReport("osgi", f.getName, Seq(mr))
+      }
+      val configReport = updateReport.configuration("scala-tool").get
+      val allNewModules = osgiModules.flatMap(_.modules) ++ configReport.modules
+      val allOrgReportts = configReport.details ++ osgiModules
+      val newConfig = new ConfigurationReport("compile", allNewModules, allOrgReportts, Seq.empty)
+      val newConfigs = Seq(newConfig) ++ (updateReport.configurations.filter(r => !Set("compile", "runtime", "compile-internal", "runtime-internal").contains(r.configuration)))
+      new UpdateReport(cached, newConfigs, new UpdateStats(0, 0, 0, false), Map.empty)
+    },
+    manifestText := {
+      val bundleDir = (classDirectory in Compile).value
+      val manifestDir = bundleDir / "META-INF"
+      IO.createDirectory(manifestDir)
+      val manifestFile = manifestDir / "MANIFEST.MF"
+      val jar = ((
+        manifestHeaders,
+        additionalHeaders,
+        fullClasspath in Compile,
+        artifactPath in(Compile, packageBin),
+        resourceDirectories in Compile,
+        embeddedJars,
+        streams
+        ) map OsgiTasks.bundleTask).value
+      Using.fileOutputStream()(manifestFile) { fo =>
+        jar.getManifest.write(fo)
+      }
+      val tpRepo = osgiRepository.value
+      repoAdminTask.value {
+        repoAdmin =>
+          val ourRepo = repoAdmin.createIndexedRepository(Seq(BundleLocation(bundleDir)))
+          repoAdmin.resolveRequirements(Seq(ourRepo, tpRepo), Seq(BundleRequirement("root"))) match {
+            case -\/(errors) => writeErrors(errors, streams.value.log)
+            case \/-(files) => FelixEmbedder.embed(BundleStartConfig(defaultStart = files), IO.temporaryDirectory) {
+              context => context.getBundles.map(_.getSymbolicName).foreach {
+                System.err.println
+              }
+            }
+
+          }
+      }
+      mapAsScalaMap(jar.getManifest.getMainAttributes).toString
+    },
+    exportPackage := Seq("com.test.sbt"),
+    resourceGenerators in Compile <+=
+
+      (resourceManaged in Compile, name, version) map { (dir, n, v) =>
+        val file = dir / "demo" / "myapp.properties"
+        val contents = "name=%s\nversion=%s".format(n, v)
+        IO.write(file, contents)
+        Seq(file)
+      },
     osgiDependencies := Seq(PackageRequirement("argonaut"), BundleRequirement("org.scalaz.core", Some(new VersionRange("(7.1,8.0]")))),
     osgiFilterRules := Seq(
       ignoreAll("globalIgnores", "slf4j-log4j12", "slf4j-jcl", "log4j", "xercesImpl", "jsr311-api", "jsr305", "activation", "commons-logging", "apache-mime4j-benchmark"),
@@ -164,119 +223,113 @@ object GenJars extends Build {
       create("poi" | "poi-ooxml" | "poi-scratchpad", symbolicName = "apache-poi", version = "3.11", imports = "org.apache.xml.security.*;resolution:=optional,org.bouncycastle.*;resolution:=optional,org.apache.jcp.xml.dsig.internal.dom;resolution:=optional,*", exports = "org.apache.poi.*"),
       rewrite("poi-ooxml-schemas", imports = "org.openxmlformats.schemas.officeDocument.x2006.math;resolution:=optional,org.openxmlformats.schemas.schemaLibrary.x2006.main;resolution:=optional,schemasMicrosoftComOfficePowerpoint;resolution:=optional,schemasMicrosoftComOfficeWord;resolution:=optional,*"),
       rewrite("xmlbeans", exports = "!org.w3c.dom,*", imports = "org.apache.xml.resolver.*;resolution:=optional,org.apache.crimson.*;resolution:=optional,org.apache.tools.ant.*;resolution:=optional,org.apache.xmlbeans.impl.xpath.saxon;resolution:=optional,org.apache.xmlbeans.impl.xquery.saxon;resolution:=optional,*")
-    ),
-    update := {
-      val updateReport = origUpdate.value
-      val cached = target.value / "update.cache"
-      val repo = osgiRepo.value
-      val deps = osgiDependencies.value
-      val resolved = repoAdminTask.value { repoAdmin =>
-        repoAdmin.resolveRequirements(repo, deps)
-      }.leftMap {
-        _.foreach(r => System.err.println(r.getRequirement))
-      }.getOrElse(Seq.empty)
-      val osgiModules = resolved.map { f =>
-        val mr = ModuleReport("osgi" % f.getName % "1.0", Seq(Artifact(f.getName) -> f), Seq.empty)
-        OrganizationArtifactReport("osgi", f.getName, Seq(mr))
-      }
-      val configReport = updateReport.configuration("scala-tool").get
-      val allNewModules = osgiModules.flatMap(_.modules) ++ configReport.modules
-      val allOrgReportts = configReport.details ++ osgiModules
-      val newConfig = new ConfigurationReport("compile", allNewModules, allOrgReportts, Seq.empty)
-      val newConfigs = Seq(newConfig) ++ (updateReport.configurations.filter(r => !Set("compile", "runtime", "compile-internal", "runtime-internal").contains(r.configuration)))
-      new UpdateReport(cached, newConfigs, new UpdateStats(0, 0, 0, false), Map.empty)
-    }
+    )
   )
 
+  def epsDeps = {
+    val akkaV = "2.3.11"
+    val streamV = "1.0-RC4"
 
-  def epsDeps = Seq(
-    "com.google.inject" % "guice" % "4.0-beta5",
-    "com.google.inject.extensions" % "guice-assistedinject" % "4.0-beta5",
-    "com.google.guava" % "guava" % "18.0",
+    Seq(
+      "com.typesafe.akka" %% "akka-stream-experimental" % streamV,
+      "com.typesafe.akka" %% "akka-http-core-experimental" % streamV,
+      "com.typesafe.akka" %% "akka-http-experimental" % streamV,
+      "com.typesafe.akka" %% "akka-actor" % akkaV,
+      "com.typesafe.akka" %% "akka-osgi" % akkaV,
+      "com.typesafe.akka" %% "akka-testkit" % akkaV % "test",
+      "org.specs2" %% "specs2-core" % "2.3.11" % "test",
+      "io.argonaut" %% "argonaut" % "6.1",
+      "org.xerial.snappy" % "snappy-java" % "1.1.1.7",
+      "org.eclipse.equinox" % "registry" % "3.5.400-v20140428-1507",
+      "org.eclipse.tycho" % "org.eclipse.osgi" % "3.10.100.v20150529-1857",
 
-    "org.scala-lang" % "scala-library" % "2.11.6",
-    "org.scala-lang.modules" % "scala-xml_2.11" % "1.0.3",
+      "com.google.inject" % "guice" % "4.0-beta5",
+      "com.google.inject.extensions" % "guice-assistedinject" % "4.0-beta5",
+      "com.google.guava" % "guava" % "18.0",
 
-    "org.apache.tomcat.embed" % "tomcat-embed-core" % "8.0.9",
-    "org.apache.tomcat.embed" % "tomcat-embed-logging-log4j" % "8.0.9",
+      "org.scala-lang" % "scala-library" % "2.11.6",
+      "org.scala-lang.modules" % "scala-xml_2.11" % "1.0.3",
 
-    "org.slf4j" % "slf4j-api" % "1.7.12",
-    "org.slf4j" % "jcl-over-slf4j" % "1.7.12",
-    "org.slf4j" % "log4j-over-slf4j" % "1.7.12",
-    "ch.qos.logback" % "logback-core" % "1.1.3",
-    "ch.qos.logback" % "logback-classic" % "1.1.3",
-    "net.logstash.logback" % "logstash-logback-encoder" % "4.2",
+      "org.apache.tomcat.embed" % "tomcat-embed-core" % "8.0.9",
+      "org.apache.tomcat.embed" % "tomcat-embed-logging-log4j" % "8.0.9",
 
-    "commons-codec" % "commons-codec" % "1.10",
-    "commons-beanutils" % "commons-beanutils" % "1.9.2",
-    "org.apache.commons" % "commons-compress" % "1.9",
+      "org.slf4j" % "slf4j-api" % "1.7.12",
+      "org.slf4j" % "jcl-over-slf4j" % "1.7.12",
+      "org.slf4j" % "log4j-over-slf4j" % "1.7.12",
+      "ch.qos.logback" % "logback-core" % "1.1.3",
+      "ch.qos.logback" % "logback-classic" % "1.1.3",
+      "net.logstash.logback" % "logstash-logback-encoder" % "4.2",
 
-    "org.apache.zookeeper" % "zookeeper" % "3.4.6",
-    "com.netflix.curator" % "curator-recipes" % "1.3.3",
-    "com.101tec" % "zkclient" % "0.3",
+      "commons-codec" % "commons-codec" % "1.10",
+      "commons-beanutils" % "commons-beanutils" % "1.9.2",
+      "org.apache.commons" % "commons-compress" % "1.9",
 
-    "org.ow2.asm" % "asm" % "4.1",
-    "org.ow2.asm" % "asm-util" % "4.1",
-    "org.ow2.asm" % "asm-tree" % "4.1",
-    "org.ow2.asm" % "asm-analysis" % "4.1",
+      "org.apache.zookeeper" % "zookeeper" % "3.4.6",
+      "com.netflix.curator" % "curator-recipes" % "1.3.3",
+      "com.101tec" % "zkclient" % "0.3",
 
-    "com.eps" % "anti-xml_2.11" % "0.5.3-8",
+      "org.ow2.asm" % "asm" % "4.1",
+      "org.ow2.asm" % "asm-util" % "4.1",
+      "org.ow2.asm" % "asm-tree" % "4.1",
+      "org.ow2.asm" % "asm-analysis" % "4.1",
 
-    "org.jboss.resteasy" % "resteasy-jaxrs" % "3.0.11.Final",
-    "org.jboss.resteasy" % "async-http-servlet-3.0" % "3.0.11.Final",
+      "com.eps" % "anti-xml_2.11" % "0.5.3-8",
 
-    "com.fasterxml.jackson.core" % "jackson-core" % "2.5.4",
-    "com.fasterxml.jackson.core" % "jackson-annotations" % "2.5.4",
-    "com.fasterxml.jackson.core" % "jackson-databind" % "2.5.4",
-    "com.fasterxml.jackson.jaxrs" % "jackson-jaxrs-json-provider" % "2.5.4",
-    "com.fasterxml.jackson.module" % "jackson-module-jsonSchema" % "2.5.4",
+      "org.jboss.resteasy" % "resteasy-jaxrs" % "3.0.11.Final",
+      "org.jboss.resteasy" % "async-http-servlet-3.0" % "3.0.11.Final",
 
-    "com.wordnik" % "swagger-core_2.11" % "1.3.12",
-    "com.wordnik" % "swagger-jaxrs_2.11" % "1.3.12",
-    "com.wordnik" % "swagger-annotations" % "1.3.12",
+      "com.fasterxml.jackson.core" % "jackson-core" % "2.5.4",
+      "com.fasterxml.jackson.core" % "jackson-annotations" % "2.5.4",
+      "com.fasterxml.jackson.core" % "jackson-databind" % "2.5.4",
+      "com.fasterxml.jackson.jaxrs" % "jackson-jaxrs-json-provider" % "2.5.4",
+      "com.fasterxml.jackson.module" % "jackson-module-jsonSchema" % "2.5.4",
 
-    "com.datastax.cassandra" % "cassandra-driver-core" % "2.1.7.1",
-    "org.hdrhistogram" % "HdrHistogram" % "2.1.4",
+      "com.wordnik" % "swagger-core_2.11" % "1.3.12",
+      "com.wordnik" % "swagger-jaxrs_2.11" % "1.3.12",
+      "com.wordnik" % "swagger-annotations" % "1.3.12",
 
+      "com.datastax.cassandra" % "cassandra-driver-core" % "2.1.7.1",
+      "org.hdrhistogram" % "HdrHistogram" % "2.1.4",
 
-    "org.scalaz" % "scalaz-core_2.11" % "7.1.2",
-    "org.scalaz" % "scalaz-effect_2.11" % "7.1.2",
+      "org.scalaz" % "scalaz-core_2.11" % "7.1.2",
+      "org.scalaz" % "scalaz-effect_2.11" % "7.1.2",
 
-    "org.hurl" % "hurl" % "1.1",
+      "org.hurl" % "hurl" % "1.1",
 
-    "junit" % "junit" % "4.12",
+      "junit" % "junit" % "4.12",
 
-    "com.pearson.statsdclient" % "statsdclient" % "1.0.0",
+      "com.pearson.statsdclient" % "statsdclient" % "1.0.0",
 
-    "com.pearson.eps.kafka" % "kafka_2.11" % "0.8.1.eps-6",
+      "com.pearson.eps.kafka" % "kafka_2.11" % "0.8.1.eps-6",
 
-    "com.pearson.seer" % "seer-restexpress-client" % "0.1.7",
-    "com.ecollege.javariddler" % "java-riddler" % "1.1",
-    "com.pearson.subpub" % "subpub-java" % "0.3.2",
+      "com.pearson.seer" % "seer-restexpress-client" % "0.1.7",
+      "com.ecollege.javariddler" % "java-riddler" % "1.1",
+      "com.pearson.subpub" % "subpub-java" % "0.3.2",
 
-    "com.amazonaws" % "aws-java-sdk-s3" % "1.10.2",
+      "com.amazonaws" % "aws-java-sdk-s3" % "1.10.2",
 
-    "org.apache.httpcomponents" % "httpcore" % "4.3",
-    "org.apache.httpcomponents" % "httpclient" % "4.3.1",
-    "org.apache.httpcomponents" % "httpasyncclient" % "4.0",
+      "org.apache.httpcomponents" % "httpcore" % "4.3",
+      "org.apache.httpcomponents" % "httpclient" % "4.3.1",
+      "org.apache.httpcomponents" % "httpasyncclient" % "4.0",
 
-    "rhino" % "js" % "1.7R2",
+      "rhino" % "js" % "1.7R2",
 
-    "net.databinder.dispatch" % "dispatch-core_2.11" % "0.11.2",
-    "redis.clients" % "jedis" % "2.1.0",
-    "com.officedrop" % "jedis-failover-equella" % "0.1.16.3",
+      "net.databinder.dispatch" % "dispatch-core_2.11" % "0.11.2",
+      "redis.clients" % "jedis" % "2.1.0",
+      "com.officedrop" % "jedis-failover-equella" % "0.1.16.3",
 
-    "org.elasticsearch" % "elasticsearch" % "1.2.1",
-    "com.sonian" % "elasticsearch-zookeeper" % "1.2.0",
+      "org.elasticsearch" % "elasticsearch" % "1.2.1",
+      "com.sonian" % "elasticsearch-zookeeper" % "1.2.0",
 
-    "org.apache.tika" % "tika-core" % "1.7",
-    "org.apache.tika" % "tika-parsers" % "1.7",
-    "org.jdom" % "jdom2" % "2.0.4",
-    "dom4j" % "dom4j" % "1.6.1",
+      "org.apache.tika" % "tika-core" % "1.7",
+      "org.apache.tika" % "tika-parsers" % "1.7",
+      "org.jdom" % "jdom2" % "2.0.4",
+      "dom4j" % "dom4j" % "1.6.1",
 
-    "org.hamcrest" % "hamcrest-library" % "1.3",
-    "org.scalacheck" % "scalacheck_2.11" % "1.12.3",
-    "net.databinder.dispatch" % "dispatch-core_2.11" % "0.11.2",
-    "com.github.scopt" % "scopt_2.11" % "3.3.0"
-  )
+      "org.hamcrest" % "hamcrest-library" % "1.3",
+      "org.scalacheck" % "scalacheck_2.11" % "1.12.3",
+      "net.databinder.dispatch" % "dispatch-core_2.11" % "0.11.2",
+      "com.github.scopt" % "scopt_2.11" % "3.3.0"
+    )
+  }
 }
