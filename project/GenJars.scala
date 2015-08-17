@@ -43,6 +43,29 @@ object GenJars extends Build {
     }
   }
 
+  val depsWithClasses = Def.task {
+    val cp = (dependencyClasspath in Compile).value
+    val classes = (classDirectory in Compile).value
+    cp ++ Seq(classes).classpath
+  }
+
+  def writeManifest = Def.task {
+    (compile in Compile).value
+  streams.value.log.info("Doing the manifest")
+    val manifestDir = (resourceManaged in Compile).value / "META-INF"
+    IO.createDirectory(manifestDir)
+    val manifestFile = manifestDir / "MANIFEST.MF"
+    val headers = manifestHeaders.value
+    val addHeaders = additionalHeaders.value
+    val cp = depsWithClasses.value
+    val jar = OsgiTasks.bundleTask(headers, addHeaders, cp, (artifactPath in(Compile, packageBin)).value,
+      (resourceDirectories in Compile).value, embeddedJars.value, streams.value)
+    Using.fileOutputStream()(manifestFile) { fo =>
+      jar.getManifest.write(fo)
+    }
+    Seq(manifestFile)
+  }
+
   lazy val cachedRepoLookup = Def.taskDyn[Repository] {
     val instructions = osgiInstructions.value
     val cacheFile = target.value / "bundle.cache"
@@ -172,14 +195,7 @@ object GenJars extends Build {
       mapAsScalaMap(jar.getManifest.getMainAttributes).toString
     },
     exportPackage := Seq("com.test.sbt"),
-    resourceGenerators in Compile <+=
-
-      (resourceManaged in Compile, name, version) map { (dir, n, v) =>
-        val file = dir / "demo" / "myapp.properties"
-        val contents = "name=%s\nversion=%s".format(n, v)
-        IO.write(file, contents)
-        Seq(file)
-      },
+    resourceGenerators in Compile += writeManifest.taskValue,
     osgiDependencies := Seq(PackageRequirement("argonaut"), BundleRequirement("org.scalaz.core", Some(new VersionRange("(7.1,8.0]")))),
     osgiFilterRules := Seq(
       ignoreAll("globalIgnores", "slf4j-log4j12", "slf4j-jcl", "log4j", "xercesImpl", "jsr311-api", "jsr305", "activation", "commons-logging", "apache-mime4j-benchmark"),
