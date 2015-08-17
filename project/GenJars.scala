@@ -3,6 +3,9 @@ import org.osgi.framework.{Version, VersionRange}
 import osgifelix._
 import osgifelix.InstructionFilter._
 import osgifelix.BundleInstructions._
+import osgifelix.Keys._
+import osgifelix.OsgiTasks
+import osgifelix.OsgiTasks._
 import sbt._
 import sbt.Keys._
 import scalaz.{\/-, -\/}
@@ -18,182 +21,31 @@ object GenJars extends Build {
   }
 
   lazy val testIt = taskKey[Seq[File]]("Test bundle creation")
-  lazy val originalUpdate = taskKey[UpdateReport]("Original update report")
-  lazy val osgiRepository = taskKey[Repository]("Repository for resolving osgi dependencies")
-  lazy val osgiInstructions = taskKey[Seq[BundleInstructions]]("Instructions for BND")
-  lazy val osgiDependencies = settingKey[Seq[OsgiRequirement]]("OSGi dependencies")
-  lazy val osgiFilterRules = settingKey[Seq[InstructionFilter]]("Filters for generating BND instructions")
   lazy val manifestText = taskKey[String]("Gen the MANIFEST")
 
-  lazy val Osgi = config("osgi")
-  lazy val FelixBundles = config("felixbundles")
-
-  lazy val repoAdminTask = Def.task {
-    val storage = target.value / "repo-admin"
-    val bundleJars = originalUpdate.value.matching(configurationFilter(FelixBundles.name) && artifactFilter(`type` = "bundle"))
-    FelixRepositories.runRepoAdmin(bundleJars, storage)
-  }
-
-  def writeErrors(reasons: Array[Reason], logger: Logger) = {
-    reasons.foreach {
-      r => logger.error {
-        val req = r.getRequirement
-        s"Failed to find ${req.getName} with ${req.getFilter} for ${r.getResource.getSymbolicName} "
-      }
-    }
-  }
-
-  val depsWithClasses = Def.task {
-    val cp = (dependencyClasspath in Compile).value
-    val classes = (classDirectory in Compile).value
-    cp ++ Seq(classes).classpath
-  }
-
-  def writeManifest = Def.task {
-    (compile in Compile).value
-  streams.value.log.info("Doing the manifest")
-    val manifestDir = (resourceManaged in Compile).value / "META-INF"
-    IO.createDirectory(manifestDir)
-    val manifestFile = manifestDir / "MANIFEST.MF"
-    val headers = manifestHeaders.value
-    val addHeaders = additionalHeaders.value
-    val cp = depsWithClasses.value
-    val jar = OsgiTasks.bundleTask(headers, addHeaders, cp, (artifactPath in(Compile, packageBin)).value,
-      (resourceDirectories in Compile).value, embeddedJars.value, streams.value)
-    Using.fileOutputStream()(manifestFile) { fo =>
-      jar.getManifest.write(fo)
-    }
-    Seq(manifestFile)
-  }
-
-  lazy val cachedRepoLookup = Def.taskDyn[Repository] {
-    val instructions = osgiInstructions.value
-    val cacheFile = target.value / "bundle.cache"
-    val binDir = target.value / "bundles"
-    val indexFile = target.value / "index.xml"
-    val cacheData = BndManifestGenerator.serialize(instructions)
-    if (cacheFile.exists() && indexFile.exists() && IO.read(cacheFile) == cacheData) {
-      Def.task {
-        repoAdminTask.value(_.loadRepository(indexFile))
-      }
-    } else Def.task {
-      IO.delete(binDir)
-      IO.delete(cacheFile)
-      IO.createDirectory(binDir)
-      val logger = streams.value.log
-      val builder = BndManifestGenerator.buildJars[Id](instructions, binDir)
-      val jars = builder.run(new BundleProgress[Id] {
-        override def info(msg: String): Id[Unit] = {
-          logger.info(msg)
-        }
-      }).map(_.jf).toSeq
-      repoAdminTask.value { repoAdmin =>
-        val repo = repoAdmin.createIndexedRepository(jars.map(BundleLocation.apply))
-        val reasons = repoAdmin.checkConsistency(repo)
-        if (reasons.isEmpty)
-        {
-          IO.write(cacheFile, cacheData)
-          repoAdmin.writeRepo(repo, indexFile)
-          repo
-        } else {
-          writeErrors(reasons, logger)
-          sys.error("Failed consistency check")
-        }
-      }
-    }
-  }
 
   lazy val root = (project in new File(".")).settings(SbtOsgi.defaultOsgiSettings: _*).settings(
     scalaVersion := "2.11.7",
-    ivyConfigurations ++= Seq(Osgi, FelixBundles),
+    ivyConfigurations ++= Seq(OsgiConfig, FelixBundles),
     libraryDependencies += "org.apache.felix" % "org.apache.felix.bundlerepository" % "2.0.4" % FelixBundles,
     originalUpdate := Classpaths.updateTask.value,
     libraryDependencies ++= {
-      toConfig(Osgi, epsDeps)
+      toConfig(OsgiConfig, epsDeps)
     },
     classifiersModule := {
       GetClassifiersModule("ok" % "ok" % "1.2", Seq.empty, Seq.empty, Seq.empty)
     },
+
     osgiInstructions := {
+      val prvVal = createInstructions.value
       Seq(manifestOnly("com.eps.sunjdk", "1.0.0", Map(
         "Fragment-Host" -> "system.bundle; extension:=framework",
         "Export-Package" -> "sun.reflect,sun.reflect.generics.reflectiveObjects,com.sun.jna,com.sun,sun.misc,com.sun.jdi,com.sun.jdi.connect,com.sun.jdi.event,com.sun.jdi.request,sun.nio.ch,com.sun.javadoc,com.sun.tools.javadoc"
-      )))
-    },
-    osgiInstructions ++= {
-      val ordered = SbtUtils.orderedDependencies(originalUpdate.value.configuration("osgi").get)
-      val typeFilter: NameFilter = "jar" | "bundle"
-      val artifacts = ordered.flatMap { mr =>
-        mr.artifacts.collectFirst {
-          case (artifact, file) if typeFilter.accept(artifact.`type`) => (mr.module, artifact, file)
-        }
-      }
-      val rules = osgiFilterRules.value
-      val (unused, insts) = OsgiTasks.convertToInstructions("com.eps.wrapper.", artifacts, rules)
-      if (unused.nonEmpty) {
-        val logger = streams.value.log
-        unused.foreach { r =>
-          logger.warn(s"OSGi filter rule '${r}' is not used")
-        }
-      }
-      insts
+      ))) ++ prvVal
     },
     osgiRepository := cachedRepoLookup.value,
-    update := {
-      val updateReport = originalUpdate.value
-      val cached = target.value / "update.cache"
-      val repo = osgiRepository.value
-      val deps = osgiDependencies.value
-      val resolved = repoAdminTask.value { repoAdmin =>
-        repoAdmin.resolveRequirements(Seq(repo), deps)
-      }.leftMap {
-        writeErrors(_, streams.value.log)
-      }.getOrElse(Seq.empty)
-      val osgiModules = resolved.map { bl =>
-        val f = bl.file
-        val mr = ModuleReport("osgi" % f.getName % "1.0", Seq(Artifact(f.getName) -> f), Seq.empty)
-        OrganizationArtifactReport("osgi", f.getName, Seq(mr))
-      }
-      val configReport = updateReport.configuration("scala-tool").get
-      val allNewModules = osgiModules.flatMap(_.modules) ++ configReport.modules
-      val allOrgReportts = configReport.details ++ osgiModules
-      val newConfig = new ConfigurationReport("compile", allNewModules, allOrgReportts, Seq.empty)
-      val newConfigs = Seq(newConfig) ++ (updateReport.configurations.filter(r => !Set("compile", "runtime", "compile-internal", "runtime-internal").contains(r.configuration)))
-      new UpdateReport(cached, newConfigs, new UpdateStats(0, 0, 0, false), Map.empty)
-    },
-    manifestText := {
-      val bundleDir = (classDirectory in Compile).value
-      val manifestDir = bundleDir / "META-INF"
-      IO.createDirectory(manifestDir)
-      val manifestFile = manifestDir / "MANIFEST.MF"
-      val jar = ((
-        manifestHeaders,
-        additionalHeaders,
-        fullClasspath in Compile,
-        artifactPath in(Compile, packageBin),
-        resourceDirectories in Compile,
-        embeddedJars,
-        streams
-        ) map OsgiTasks.bundleTask).value
-      Using.fileOutputStream()(manifestFile) { fo =>
-        jar.getManifest.write(fo)
-      }
-      val tpRepo = osgiRepository.value
-      repoAdminTask.value {
-        repoAdmin =>
-          val ourRepo = repoAdmin.createIndexedRepository(Seq(BundleLocation(bundleDir)))
-          repoAdmin.resolveRequirements(Seq(ourRepo, tpRepo), Seq(BundleRequirement("root"))) match {
-            case -\/(errors) => writeErrors(errors, streams.value.log)
-            case \/-(files) => FelixEmbedder.embed(BundleStartConfig(defaultStart = files), IO.temporaryDirectory) {
-              context => context.getBundles.map(_.getSymbolicName).foreach {
-                System.err.println
-              }
-            }
-
-          }
-      }
-      mapAsScalaMap(jar.getManifest.getMainAttributes).toString
-    },
+    update := osgiUpdateReport.value,
+    osgiPrefix := "com.eps.test.",
     exportPackage := Seq("com.test.sbt"),
     resourceGenerators in Compile += writeManifest.taskValue,
     osgiDependencies := Seq(PackageRequirement("argonaut"), BundleRequirement("org.scalaz.core", Some(new VersionRange("(7.1,8.0]")))),
