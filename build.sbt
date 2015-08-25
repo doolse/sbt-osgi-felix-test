@@ -1,8 +1,6 @@
 import com.typesafe.sbt.osgi.OsgiKeys._
 
-enablePlugins(OsgiFelixPlugin)
-
-defaultSingleProjectSettings ++ defaultOsgiSettings
+defaultSingleProjectSettings ++ deploymentSettings
 
 scalaVersion := "2.11.6"
 
