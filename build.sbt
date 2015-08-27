@@ -1,4 +1,5 @@
 import com.typesafe.sbt.osgi.OsgiKeys._
+import osgifelix.OsgiFelixPlugin.autoImport._
 
 defaultSingleProjectSettings ++ deploymentSettings
 
@@ -13,15 +14,19 @@ libraryDependencies ++= Seq(
   "org.slf4j" % "log4j-over-slf4j" % "1.7.12",
   "org.apache.zookeeper" % "zookeeper" % "3.4.6")
 
-osgiFilterRules := Seq(
+lazy val scalacheck = "org.scalacheck" %% "scalacheck" % "1.12.0"
+
+libraryDependencies += scalacheck % Test
+
+osgiRepositoryRules := Seq(
   rewrite("zookeeper", imports = "org.ieft.jgss.*,org.apache.log4j.jmx.*;resolution:=optional,*"),
-  ignoreAll("globalIgnores", "log4j", "slf4j-log4j12"),
   create("elasticsearch" | "lucene*", symbolicName = "elasticsearch", version = "1.2.1",
     imports = "com.vividsolutions.jts.*;resolution:=optional,org.hyperic.sigar;resolution:=optional,org.apache.regexp;resolution:=optional,*",
-    exports = "org.apache.lucene.*,org.elasticsearch.*,org.tartarus.snowball.*")
+    exports = "org.apache.lucene.*,org.elasticsearch.*,org.tartarus.snowball.*"),
+  ignoreAll("log4j", "slf4j-log4j12")
 )
 
-osgiDependencies := packageReqs("org.elasticsearch.client")
+osgiDependencies in Compile := packageReqs("org.elasticsearch.client")
 
 bundleActivator := Some("testbundle.OsgiBundle")
 
